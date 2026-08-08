@@ -1,0 +1,95 @@
+                "complete_depth_fraction_10000": float(sub["complete_depth_10000"].mean()) if len(sub) else np.nan,
+                "median_path_depth": float(sub["path_depth_notional"].median()) if len(sub) else np.nan,
+            })
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def select_rule(surface: pd.DataFrame) -> dict[str, object]:
+    dev = surface[(surface["split"] == "development") & (surface["events"] >= 20)].copy()
+    if dev.empty:
+        dev = surface[surface["split"] == "development"].copy()
+    # Commercially honest score: prioritize crossing and response, penalize tiny samples and market-chase losses.
+    dev["score"] = (
+        dev["crossing_rate"].fillna(0) * 2.0
+        + np.tanh(dev["mean_response_bps"].fillna(-100)/10.0)
+        + np.minimum(dev["events"], 100)/100.0
+        + np.tanh(dev["mean_net_chase_bps_1000"].fillna(-100)/20.0)
+    )
+    best = dev.sort_values(["score", "events"], ascending=False).iloc[0]
+    keys = ["wall_percentile", "prominence", "reduction", "gamma"]
+    selected = {k: float(best[k]) for k in keys}
+    selected["development_events"] = int(best["events"])
+    selected["development_score"] = float(best["score"])
+    test = surface[(surface["split"] == "holdout")]
+    for k, v in selected.items():
+        if k in keys:
+            test = test[np.isclose(test[k], v)]
+    selected["holdout"] = test.iloc[0].to_dict() if len(test) else None
+    return selected
+
+
+def money_table(selected: dict[str, object], surface: pd.DataFrame) -> pd.DataFrame:
+    # Use observed holdout event rate and market-chase net bps only as a diagnostic. Also show required target economics.
+    hold = selected.get("holdout") or {}
+    events_per_day = float(hold.get("events") or 0)
+    observed_bps = float(hold.get("mean_net_chase_bps_1000")) if hold.get("mean_net_chase_bps_1000") is not None else np.nan
+    rows = []
+    for account in range(5000, 50001, 5000):
+        capacity = min(account, 10000.0)
+        event_fraction = min(1.0, capacity/account)
+        for label, net_bps, turnover, utilization in (
+            ("observed_single_venue_chase_diagnostic", observed_bps, min(events_per_day*capacity/account, 3.0), 1.0),
+            ("commercial_target", 3.0, 1.5, .70),
+        ):
+            if not np.isfinite(net_bps):
+                monthly = np.nan
+            else:
+                daily_rate = net_bps/10000 * turnover * utilization
+                monthly = account*((1+daily_rate)**(365/12)-1)
+            rows.append({"account": account, "scenario": label, "net_bps": net_bps, "daily_turnover": turnover, "utilization": utilization, "monthly_dollars": monthly, "events_per_day": events_per_day, "capacity_assumption": capacity, "event_fraction": event_fraction})
+    return pd.DataFrame(rows)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default="hf_data")
+    ap.add_argument("--output-dir", default="results")
+    ap.add_argument("--development-day", default="2026-06-10")
+    ap.add_argument("--holdout-day", default="2026-07-10")
+    ap.add_argument("--assets", nargs="+", default=list(ASSETS))
+    ap.add_argument("--sample-ms", type=int, default=1000)
+    ap.add_argument("--levels", type=int, default=50)
+    args = ap.parse_args()
+
+    root = Path(args.data_dir)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    inventory = resolve_inventory()
+    (out/"remote_inventory.json").write_text(json.dumps([asdict(x) for x in inventory], indent=2)+"\n")
+    download_rows = download_inventory(inventory, root)
+    (out/"download_manifest.json").write_text(json.dumps(download_rows, indent=2)+"\n")
+
+    con = duckdb.connect()
+    time_inv = get_time_inventory(con, root)
+    time_inv.to_csv(out/"time_inventory.csv", index=False)
+
+    all_events: list[pd.DataFrame] = []
+    daily_rows: list[dict[str, object]] = []
+    cuts_rows: list[dict[str, object]] = []
+    events_by_split: dict[str, list[pd.DataFrame]] = {"development": [], "holdout": []}
+
+    for split, day in (("development", args.development_day), ("holdout", args.holdout_day)):
+        start_ms = utc_ms(day + "T00:00:00Z")
+        end_ms = start_ms + DAY_MS
+        for asset in args.assets:
+            print(f"scan {split} {asset} {day}", flush=True)
+            snapshot, snap_ts, anchor = load_snapshot(con, root, asset, start_ms)
+            depth, trades = load_window(con, root, asset, start_ms, end_ms, snap_ts)
+            samples, gap_info = reconstruct_samples(snapshot, depth, start_ms, end_ms, anchor, sample_ms=args.sample_ms, levels=args.levels)
+            buy, sell, max_trade, min_trade = trade_buckets(trades, start_ms, end_ms, args.sample_ms)
+            calibration_end = max(60, min(len(samples), int(len(samples)*.25)))
+            events, cuts = candidate_features(samples, calibration_end, buy, sell, max_trade, min_trade)
+            events["asset"] = asset
+            events["split"] = split
+            events["date"] = day
