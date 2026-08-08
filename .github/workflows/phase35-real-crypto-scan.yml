@@ -1,0 +1,77 @@
+name: Phase 35 real crypto LOB scan
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - wall-lifecycle-phase35-data-run
+    paths:
+      - phase35_scan.py
+      - .github/workflows/phase35-real-crypto-scan.yml
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout isolated research branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install read-only research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests duckdb pandas numpy pyarrow
+
+      - name: Show runner capacity
+        run: |
+          df -h
+          free -h
+          python --version
+
+      - name: Download public data and run real scan
+        run: |
+          python phase35_scan.py \
+            --data-dir hf_data \
+            --output-dir results \
+            --development-day 2026-06-10 \
+            --holdout-day 2026-07-10 \
+            --assets BTCUSDT ETHUSDT SOLUSDT \
+            --sample-ms 1000 \
+            --levels 50
+
+      - name: Package results
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib, zipfile
+          root = pathlib.Path('results')
+          root.mkdir(exist_ok=True)
+          with zipfile.ZipFile('phase35-real-scan-results.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, p.as_posix())
+          print(json.dumps({'files': [p.as_posix() for p in sorted(root.rglob('*')) if p.is_file()]}, indent=2))
+          PY
+
+      - name: Upload real-data result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase35-real-scan-results
+          path: |
+            phase35-real-scan-results.zip
+            results/**
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
