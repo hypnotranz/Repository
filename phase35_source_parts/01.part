@@ -101,8 +101,10 @@ def reconstruct_samples(
         if last_id <= prev_id:
             continue
         if not (first_id <= prev_id + 1 <= last_id):
+            # Keep an integrity warning, but reset rather than freezing the
+            # remainder of the day. Diff rows contain absolute quantities.
             gaps.append({"timestamp_ms": ts, "previous_update_id": prev_id, "first_update_id": first_id, "last_update_id": last_id})
-            break
+            prev_id = first_id - 1
         while next_sample < ts and next_sample < end_ms:
             emit(next_sample)
             next_sample += sample_ms
