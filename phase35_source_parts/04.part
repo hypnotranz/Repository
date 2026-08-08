@@ -1,0 +1,80 @@
+                "aligned_net_flow_1s": net_flow,
+                "aligned_gross_flow_1s": gross_aligned,
+                "gamma_net": gamma,
+                "gamma_gross": gamma_gross,
+                "one_second_response_bps": one_sec_bps,
+                "response_10s_bps": response_bps,
+                "crossed_old_wall_10s": trade_cross,
+                "support_prominence": support_prominence,
+                "support_notional": support_notional,
+                "field_width_bps": field_width_bps,
+            }
+            for pct, cutoff in cuts[side].items():
+                row[f"passes_wall_pct_{pct}"] = bool(cand["notional"] >= cutoff)
+                row[f"wall_cutoff_{pct}"] = cutoff
+            # Size-dependent entry/exit proxy at t+1 and t+10.
+            entry_sample = samples[t + 1]
+            exit_sample = samples[t + response_s]
+            for notional in (1000, 2500, 5000, 10000, 25000, 50000):
+                if direction > 0:
+                    entry_quote, base, ok1 = book_walk_quote(entry_sample, "buy", quote_notional=notional)
+                    exit_quote, _, ok2 = book_walk_quote(exit_sample, "sell", base_quantity=base) if ok1 else (np.nan, np.nan, False)
+                    gross = (exit_quote - entry_quote) / notional * 10_000.0 if ok1 and ok2 else np.nan
+                else:
+                    entry_quote, base, ok1 = book_walk_quote(entry_sample, "sell", quote_notional=notional)
+                    exit_quote, _, ok2 = book_walk_quote(exit_sample, "buy", base_quantity=base) if ok1 else (np.nan, np.nan, False)
+                    gross = (entry_quote - exit_quote) / notional * 10_000.0 if ok1 and ok2 else np.nan
+                row[f"gross_chase_bps_{notional}"] = gross
+                row[f"complete_depth_{notional}"] = bool(ok1 and ok2)
+                # Severe single-venue spot hurdle: 10 bps each fill + 3 bps reserve.
+                row[f"net_chase_bps_{notional}"] = gross - 23.0 if np.isfinite(gross) else np.nan
+            rows.append(row)
+            last_event_idx = t
+            break
+    return pd.DataFrame(rows), cuts
+
+
+def summarize_day(asset: str, split: str, samples: Sequence[Sample], events: pd.DataFrame, gaps: dict[str, object]) -> dict[str, object]:
+    mid = np.array([s.midpoint for s in samples], dtype=float)
+    spread_bps = np.array([s.spread/s.midpoint*10000 for s in samples], dtype=float)
+    return {
+        "asset": asset,
+        "split": split,
+        "samples": len(samples),
+        "start": datetime.fromtimestamp(samples[0].timestamp_ms/1000, tz=timezone.utc).isoformat() if samples else None,
+        "end": datetime.fromtimestamp(samples[-1].timestamp_ms/1000, tz=timezone.utc).isoformat() if samples else None,
+        "median_midpoint": float(np.nanmedian(mid)) if len(mid) else np.nan,
+        "median_spread_bps": float(np.nanmedian(spread_bps)) if len(spread_bps) else np.nan,
+        "return_volatility_bps_1s": float(np.nanstd(np.diff(np.log(mid)))*10000) if len(mid)>2 else np.nan,
+        "candidate_events": int(len(events)),
+        "gamma_ge_0_1": int((events["gamma_net"] >= .10).sum()) if not events.empty else 0,
+        "crossing_rate_gamma_ge_0_1": float(events.loc[events["gamma_net"]>=.10, "crossed_old_wall_10s"].mean()) if not events.empty and (events["gamma_net"]>=.10).any() else np.nan,
+        "mean_response_gamma_ge_0_1_bps": float(events.loc[events["gamma_net"]>=.10, "response_10s_bps"].mean()) if not events.empty and (events["gamma_net"]>=.10).any() else np.nan,
+        "sequence_gaps": len(gaps.get("gaps", [])),
+    }
+
+
+def grid_surface(events_by_split: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    configs = [GridConfig(*x) for x in itertools.product((.95,.975,.99), (2.5,3.0,5.0), (.5,.75), (.05,.10,.25))]
+    rows: list[dict[str, object]] = []
+    for cfg in configs:
+        pass_col = f"passes_wall_pct_{cfg.wall_percentile}"
+        for split, events in events_by_split.items():
+            if events.empty:
+                sub = events
+            else:
+                sub = events[
+                    events[pass_col].astype(bool)
+                    & (events["wall_prominence"] >= cfg.prominence)
+                    & (events["durable_reduction"] >= cfg.reduction)
+                    & (events["gamma_net"] >= cfg.gamma)
+                ]
+            row = asdict(cfg)
+            row.update({
+                "split": split,
+                "events": int(len(sub)),
+                "crossing_rate": float(sub["crossed_old_wall_10s"].mean()) if len(sub) else np.nan,
+                "mean_response_bps": float(sub["response_10s_bps"].mean()) if len(sub) else np.nan,
+                "median_response_bps": float(sub["response_10s_bps"].median()) if len(sub) else np.nan,
+                "positive_response_fraction": float((sub["response_10s_bps"]>0).mean()) if len(sub) else np.nan,
+                "mean_net_chase_bps_1000": float(sub["net_chase_bps_1000"].mean()) if len(sub) else np.nan,
