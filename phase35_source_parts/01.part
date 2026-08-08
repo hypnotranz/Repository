@@ -32,7 +32,7 @@ def load_window(con: duckdb.DuckDBPyConnection, root: Path, asset: str, start_ms
         SELECT timestamp_ms, side, price, quantity, first_update_id, last_update_id
         FROM read_parquet('{depth_path}')
         WHERE asset=? AND timestamp_ms>=? AND timestamp_ms<?
-        ORDER BY timestamp_ms, first_update_id, last_update_id, side, price
+        ORDER BY last_update_id, first_update_id, timestamp_ms, side, price
         """,
         [asset, snap_ts, end_ms],
     ).fetch_df()
@@ -95,30 +95,47 @@ def reconstruct_samples(
             next_sample += sample_ms
         return samples, {"gaps": gaps, "last_update_id": prev_id}
 
-    group_cols = ["timestamp_ms", "first_update_id", "last_update_id"]
-    for keys, group in depth.groupby(group_cols, sort=False):
-        ts, first_id, last_id = map(int, keys)
+    ts_values = depth["timestamp_ms"].to_numpy(dtype=np.int64)
+    first_values = depth["first_update_id"].to_numpy(dtype=np.int64)
+    last_values = depth["last_update_id"].to_numpy(dtype=np.int64)
+    side_values = depth["side"].astype(str).str.lower().to_numpy()
+    price_values = depth["price"].to_numpy(dtype=np.float64)
+    quantity_values = depth["quantity"].to_numpy(dtype=np.float64)
+    i = 0
+    last_effective_ts = int(snapshot["timestamp_ms"].max()) if "timestamp_ms" in snapshot.columns else int(start_ms)
+    total_rows = len(depth)
+    while i < total_rows:
+        first_id = int(first_values[i])
+        last_id = int(last_values[i])
+        j = i + 1
+        while j < total_rows and int(first_values[j]) == first_id and int(last_values[j]) == last_id:
+            j += 1
         if last_id <= prev_id:
+            i = j
             continue
         if not (first_id <= prev_id + 1 <= last_id):
-            # Keep an integrity warning, but reset rather than freezing the
-            # remainder of the day. Diff rows contain absolute quantities.
-            gaps.append({"timestamp_ms": ts, "previous_update_id": prev_id, "first_update_id": first_id, "last_update_id": last_id})
+            # Preserve the warning but reset. Each diff row is an absolute
+            # level quantity, so the subsequent state remains analyzable while
+            # the affected asset-day is flagged for sensitivity review.
+            gaps.append({"timestamp_ms": int(ts_values[i]), "previous_update_id": prev_id, "first_update_id": first_id, "last_update_id": last_id})
             prev_id = first_id - 1
-        while next_sample < ts and next_sample < end_ms:
+        event_ts = max(last_effective_ts, int(np.max(ts_values[i:j])))
+        while next_sample < event_ts and next_sample < end_ms:
             emit(next_sample)
             next_sample += sample_ms
-        for row in group.itertuples(index=False):
-            target = bids if str(row.side).lower() == "bid" else asks
-            price = float(row.price)
-            qty = float(row.quantity)
+        for k in range(i, j):
+            target = bids if side_values[k] == "bid" else asks
+            price = float(price_values[k])
+            qty = float(quantity_values[k])
             if qty <= 0:
                 target.pop(price, None)
             else:
                 target[price] = qty
         prev_id = last_id
-        if next_sample == ts and next_sample < end_ms:
+        last_effective_ts = event_ts
+        if next_sample == event_ts and next_sample < end_ms:
             emit(next_sample)
             next_sample += sample_ms
+        i = j
     while next_sample < end_ms:
         emit(next_sample)
