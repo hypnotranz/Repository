@@ -1,0 +1,95 @@
+            cuts[side][str(pct)] = float(np.quantile(arr, pct)) if len(arr) else float("nan")
+
+    rows: list[dict[str, object]] = []
+    wall_history: dict[str, tuple[float | None, int]] = {"ask": (None, 0), "bid": (None, 0)}
+    last_event_idx = -10
+    n = len(samples)
+    for t in range(2, n - response_s - 1):
+        prev = samples[t - 1]
+        curr = samples[t]
+        # update age based on previous sample candidates
+        prev_candidates = {side: wall_candidate(prev, side) for side in ("ask", "bid")}
+        for side, cand in prev_candidates.items():
+            old_price, age = wall_history[side]
+            if cand is not None and old_price is not None and math.isclose(cand["price"], old_price, rel_tol=0, abs_tol=max(abs(cand["price"]), 1.0)*1e-12):
+                wall_history[side] = (cand["price"], age + 1)
+            elif cand is not None:
+                wall_history[side] = (cand["price"], 1)
+            else:
+                wall_history[side] = (None, 0)
+
+        if t - last_event_idx < 5:
+            continue
+        for side in ("ask", "bid"):
+            cand = prev_candidates[side]
+            if cand is None:
+                continue
+            hist_price, age = wall_history[side]
+            if age < 1:
+                continue
+            old_qty = cand["quantity"]
+            new_qty = quantity_at(curr, side, cand["price"])
+            reduction = 1.0 - new_qty / max(old_qty, 1e-12)
+            if reduction < 0.25 or cand["prominence"] < 2.0:
+                continue
+            # Confirm old level remains reduced one second later.
+            next_qty = quantity_at(samples[t + 1], side, cand["price"])
+            durable_reduction = 1.0 - next_qty / max(old_qty, 1e-12)
+            if durable_reduction < 0.25:
+                continue
+
+            replacement = wall_candidate(curr, side)
+            fallback_direction = +1 if side == "ask" else -1
+            direction = fallback_direction
+            replacement_price = np.nan
+            replacement_displacement_bps = np.nan
+            if replacement is not None and replacement["prominence"] >= 2.0 and not math.isclose(replacement["price"], cand["price"], rel_tol=0, abs_tol=max(abs(cand["price"]),1.0)*1e-12):
+                replacement_price = replacement["price"]
+                delta = replacement_price - cand["price"]
+                if delta != 0:
+                    direction = +1 if delta > 0 else -1
+                    replacement_displacement_bps = delta / prev.midpoint * 10_000.0
+
+            path = path_depth_notional(curr, side, cand["price"])
+            if direction > 0:
+                net_flow = buy_flow[t] - sell_flow[t]
+                gross_aligned = buy_flow[t]
+            else:
+                net_flow = sell_flow[t] - buy_flow[t]
+                gross_aligned = sell_flow[t]
+            gamma = net_flow / max(path, 1e-9)
+            gamma_gross = gross_aligned / max(path, 1e-9)
+            future = samples[t + response_s]
+            response_bps = direction * (future.midpoint / curr.midpoint - 1.0) * 10_000.0
+            one_sec_bps = direction * (samples[t + 1].midpoint / curr.midpoint - 1.0) * 10_000.0
+            if direction > 0:
+                trade_cross = bool(np.nanmax(max_trade[t + 1:t + response_s + 1]) >= cand["price"]) if np.isfinite(max_trade[t + 1:t + response_s + 1]).any() else False
+            else:
+                trade_cross = bool(np.nanmin(min_trade[t + 1:t + response_s + 1]) <= cand["price"]) if np.isfinite(min_trade[t + 1:t + response_s + 1]).any() else False
+            # Opposing support at current sample.
+            support_side = "bid" if direction > 0 else "ask"
+            support = wall_candidate(curr, support_side)
+            support_prominence = support["prominence"] if support else np.nan
+            support_notional = support["notional"] if support else np.nan
+            field_width_bps = np.nan
+            if support is not None:
+                field_width_bps = abs(cand["price"] - support["price"]) / curr.midpoint * 10_000.0
+
+            row: dict[str, object] = {
+                "timestamp_ms": curr.timestamp_ms,
+                "timestamp": datetime.fromtimestamp(curr.timestamp_ms/1000, tz=timezone.utc).isoformat(),
+                "side": side,
+                "direction": direction,
+                "old_wall_price": cand["price"],
+                "wall_level": int(cand["level"]),
+                "wall_notional": cand["notional"],
+                "wall_quantity": cand["quantity"],
+                "wall_prominence": cand["prominence"],
+                "wall_age_s": age,
+                "wall_reduction": reduction,
+                "durable_reduction": durable_reduction,
+                "replacement_price": replacement_price,
+                "replacement_displacement_bps": replacement_displacement_bps,
+                "midpoint": curr.midpoint,
+                "spread_bps": curr.spread / curr.midpoint * 10_000.0,
+                "path_depth_notional": path,
