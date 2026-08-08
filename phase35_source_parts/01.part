@@ -1,0 +1,122 @@
+        raise RuntimeError(f"no snapshot for {asset} before {start_ms}")
+    snap_ts = int(ts_row[0])
+    columns = {str(r[0]) for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{snapshot_path}')").fetchall()}
+    select_cols = "timestamp_ms, side, price, quantity" + (", last_update_id" if "last_update_id" in columns else "")
+    snap = con.execute(
+        f"SELECT {select_cols} FROM read_parquet('{snapshot_path}') WHERE asset=? AND timestamp_ms=? ORDER BY side, price",
+        [asset, snap_ts],
+    ).fetch_df()
+    if snap.empty:
+        raise RuntimeError("empty snapshot")
+    if "last_update_id" in snap.columns and snap["last_update_id"].notna().any():
+        anchor = int(snap["last_update_id"].max())
+    else:
+        # The public snapshot schema documents no update id. Depth updates are
+        # absolute quantities, so start from the first sequence batch at or
+        # after the anchor timestamp and set the continuity predecessor to U-1.
+        row = con.execute(
+            f"SELECT first_update_id FROM read_parquet('{depth_path}') WHERE asset=? AND timestamp_ms>=? ORDER BY timestamp_ms, first_update_id LIMIT 1",
+            [asset, snap_ts],
+        ).fetchone()
+        if not row or row[0] is None:
+            raise RuntimeError(f"no depth sequence after snapshot for {asset}")
+        anchor = int(row[0]) - 1
+    return snap, snap_ts, anchor
+
+
+def load_window(con: duckdb.DuckDBPyConnection, root: Path, asset: str, start_ms: int, end_ms: int, snap_ts: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    depth_path = parquet_glob(root, "depth")
+    trades_path = parquet_glob(root, "trades")
+    depth = con.execute(
+        f"""
+        SELECT timestamp_ms, side, price, quantity, first_update_id, last_update_id
+        FROM read_parquet('{depth_path}')
+        WHERE asset=? AND timestamp_ms>=? AND timestamp_ms<?
+        ORDER BY timestamp_ms, first_update_id, last_update_id, side, price
+        """,
+        [asset, snap_ts, end_ms],
+    ).fetch_df()
+    trades = con.execute(
+        f"""
+        SELECT timestamp_ms, trade_id, price, quantity, buyer_maker
+        FROM read_parquet('{trades_path}')
+        WHERE asset=? AND timestamp_ms>=? AND timestamp_ms<?
+        ORDER BY timestamp_ms, trade_id
+        """,
+        [asset, start_ms, end_ms],
+    ).fetch_df()
+    return depth, trades
+
+
+def top_levels(book: dict[float, float], reverse: bool, n: int) -> tuple[np.ndarray, np.ndarray]:
+    items = sorted(((p, q) for p, q in book.items() if q > 0), reverse=reverse)[:n]
+    p = np.full(n, np.nan, dtype=np.float64)
+    q = np.zeros(n, dtype=np.float64)
+    for i, (price, qty) in enumerate(items):
+        p[i] = price
+        q[i] = qty
+    return p, q
+
+
+def reconstruct_samples(
+    snapshot: pd.DataFrame,
+    depth: pd.DataFrame,
+    start_ms: int,
+    end_ms: int,
+    anchor: int,
+    *,
+    sample_ms: int = 1000,
+    levels: int = 50,
+) -> tuple[list[Sample], dict[str, object]]:
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
+    for row in snapshot.itertuples(index=False):
+        side = str(row.side).lower()
+        target = bids if side == "bid" else asks
+        qty = float(row.quantity)
+        price = float(row.price)
+        if qty > 0:
+            target[price] = qty
+    prev_id = int(anchor)
+    samples: list[Sample] = []
+    next_sample = int(start_ms)
+    gaps: list[dict[str, int]] = []
+
+    def emit(ts: int) -> None:
+        bp, bq = top_levels(bids, True, levels)
+        ap, aq = top_levels(asks, False, levels)
+        if not np.isfinite(bp[0]) or not np.isfinite(ap[0]) or bp[0] >= ap[0]:
+            return
+        samples.append(Sample(ts, float((bp[0] + ap[0]) / 2), float(ap[0] - bp[0]), bp, bq, ap, aq))
+
+    if depth.empty:
+        while next_sample < end_ms:
+            emit(next_sample)
+            next_sample += sample_ms
+        return samples, {"gaps": gaps, "last_update_id": prev_id}
+
+    group_cols = ["timestamp_ms", "first_update_id", "last_update_id"]
+    for keys, group in depth.groupby(group_cols, sort=False):
+        ts, first_id, last_id = map(int, keys)
+        if last_id <= prev_id:
+            continue
+        if not (first_id <= prev_id + 1 <= last_id):
+            gaps.append({"timestamp_ms": ts, "previous_update_id": prev_id, "first_update_id": first_id, "last_update_id": last_id})
+            break
+        while next_sample < ts and next_sample < end_ms:
+            emit(next_sample)
+            next_sample += sample_ms
+        for row in group.itertuples(index=False):
+            target = bids if str(row.side).lower() == "bid" else asks
+            price = float(row.price)
+            qty = float(row.quantity)
+            if qty <= 0:
+                target.pop(price, None)
+            else:
+                target[price] = qty
+        prev_id = last_id
+        if next_sample == ts and next_sample < end_ms:
+            emit(next_sample)
+            next_sample += sample_ms
+    while next_sample < end_ms:
+        emit(next_sample)
