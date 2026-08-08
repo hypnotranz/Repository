@@ -1,0 +1,116 @@
+        next_sample += sample_ms
+    return samples, {"gaps": gaps, "last_update_id": prev_id}
+
+
+def trade_buckets(trades: pd.DataFrame, start_ms: int, end_ms: int, sample_ms: int = 1000) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n = int(math.ceil((end_ms - start_ms) / sample_ms))
+    buy = np.zeros(n, dtype=float)
+    sell = np.zeros(n, dtype=float)
+    max_price = np.full(n, np.nan)
+    min_price = np.full(n, np.nan)
+    if trades.empty:
+        return buy, sell, max_price, min_price
+    idx = ((trades["timestamp_ms"].to_numpy(dtype=np.int64) - start_ms) // sample_ms).astype(int)
+    valid = (idx >= 0) & (idx < n)
+    for i, row in zip(idx[valid], trades.loc[valid].itertuples(index=False)):
+        notional = float(row.price) * float(row.quantity)
+        if bool(row.buyer_maker):
+            sell[i] += notional
+        else:
+            buy[i] += notional
+        p = float(row.price)
+        max_price[i] = p if not np.isfinite(max_price[i]) else max(max_price[i], p)
+        min_price[i] = p if not np.isfinite(min_price[i]) else min(min_price[i], p)
+    return buy, sell, max_price, min_price
+
+
+def quantity_at(sample: Sample, side: str, price: float) -> float:
+    ps = sample.asks_p if side == "ask" else sample.bids_p
+    qs = sample.asks_q if side == "ask" else sample.bids_q
+    hit = np.where(np.isfinite(ps) & np.isclose(ps, price, rtol=0, atol=max(abs(price), 1.0) * 1e-12))[0]
+    return float(qs[hit[0]]) if len(hit) else 0.0
+
+
+def wall_candidate(sample: Sample, side: str, min_level: int = 1, max_level: int = 20) -> dict[str, float] | None:
+    ps = sample.asks_p if side == "ask" else sample.bids_p
+    qs = sample.asks_q if side == "ask" else sample.bids_q
+    lo = min_level
+    hi = min(max_level, len(ps))
+    valid = np.isfinite(ps[lo:hi]) & (qs[lo:hi] > 0)
+    if not valid.any():
+        return None
+    notionals = ps[lo:hi] * qs[lo:hi]
+    notionals = np.where(valid, notionals, -np.inf)
+    rel = int(np.nanargmax(notionals))
+    idx = lo + rel
+    peers = np.delete(notionals[np.isfinite(notionals)], rel) if np.isfinite(notionals[rel]) else np.array([])
+    peer_med = float(np.nanmedian(peers)) if len(peers) else 0.0
+    size = float(ps[idx] * qs[idx])
+    return {
+        "level": idx + 1,
+        "price": float(ps[idx]),
+        "quantity": float(qs[idx]),
+        "notional": size,
+        "prominence": size / max(peer_med, 1e-9),
+    }
+
+
+def path_depth_notional(sample: Sample, side: str, old_wall_price: float) -> float:
+    ps = sample.asks_p if side == "ask" else sample.bids_p
+    qs = sample.asks_q if side == "ask" else sample.bids_q
+    if side == "ask":
+        mask = np.isfinite(ps) & (ps < old_wall_price)
+    else:
+        mask = np.isfinite(ps) & (ps > old_wall_price)
+    return float(np.sum(ps[mask] * qs[mask]))
+
+
+def book_walk_quote(sample: Sample, action: str, quote_notional: float | None = None, base_quantity: float | None = None) -> tuple[float, float, bool]:
+    if action == "buy":
+        ps, qs = sample.asks_p, sample.asks_q
+    elif action == "sell":
+        ps, qs = sample.bids_p, sample.bids_q
+    else:
+        raise ValueError(action)
+    quote = 0.0
+    base = 0.0
+    if quote_notional is not None:
+        remaining_quote = float(quote_notional)
+        for p, q in zip(ps, qs):
+            if not np.isfinite(p) or q <= 0:
+                continue
+            cap_quote = float(p * q)
+            used_quote = min(remaining_quote, cap_quote)
+            base += used_quote / p
+            quote += used_quote
+            remaining_quote -= used_quote
+            if remaining_quote <= 1e-8:
+                return quote, base, True
+        return quote, base, False
+    if base_quantity is None:
+        raise ValueError("base_quantity or quote_notional required")
+    remaining = float(base_quantity)
+    for p, q in zip(ps, qs):
+        if not np.isfinite(p) or q <= 0:
+            continue
+        used = min(remaining, float(q))
+        base += used
+        quote += used * float(p)
+        remaining -= used
+        if remaining <= 1e-12:
+            return quote, base, True
+    return quote, base, False
+
+
+def candidate_features(samples: Sequence[Sample], calibration_end_idx: int, buy_flow: np.ndarray, sell_flow: np.ndarray, max_trade: np.ndarray, min_trade: np.ndarray, *, response_s: int = 10) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
+    # Calibrate absolute notional cutoffs from levels 2-20 on development calibration period.
+    cuts: dict[str, dict[str, float]] = {"ask": {}, "bid": {}}
+    for side in ("ask", "bid"):
+        values = []
+        for s in samples[:calibration_end_idx]:
+            ps = s.asks_p if side == "ask" else s.bids_p
+            qs = s.asks_q if side == "ask" else s.bids_q
+            x = ps[1:20] * qs[1:20]
+            values.extend(x[np.isfinite(x) & (x > 0)].tolist())
+        arr = np.asarray(values, dtype=float)
+        for pct in (0.90, 0.95, 0.975, 0.99, 0.995):
