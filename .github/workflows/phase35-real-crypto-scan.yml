@@ -6,7 +6,7 @@ on:
     branches:
       - wall-lifecycle-phase35-data-run
     paths:
-      - phase35_scan.py
+      - phase35_source_parts/**
       - .github/workflows/phase35-real-crypto-scan.yml
 
 permissions:
@@ -22,6 +22,12 @@ jobs:
     steps:
       - name: Checkout isolated research branch
         uses: actions/checkout@v4
+
+      - name: Reconstruct scanner source exactly
+        run: |
+          cat phase35_source_parts/*.part > phase35_scan.py
+          python -m py_compile phase35_scan.py
+          sha256sum phase35_scan.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
