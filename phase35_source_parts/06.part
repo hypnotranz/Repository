@@ -1,0 +1,41 @@
+            all_events.append(events)
+            events_by_split[split].append(events)
+            daily_rows.append(summarize_day(asset, split, samples, events, gap_info))
+            for side, by_pct in cuts.items():
+                for pct, cutoff in by_pct.items():
+                    cuts_rows.append({"asset": asset, "split": split, "side": side, "percentile": float(pct), "cutoff_notional": cutoff})
+            print({"asset":asset,"split":split,"samples":len(samples),"events":len(events),"gaps":len(gap_info.get('gaps',[]))}, flush=True)
+            del depth, trades, samples
+
+    event_df = pd.concat(all_events, ignore_index=True) if all_events else pd.DataFrame()
+    event_df.to_csv(out/"events.csv.gz", index=False, compression={"method":"gzip","mtime":0})
+    pd.DataFrame(daily_rows).to_csv(out/"daily_summary.csv", index=False)
+    pd.DataFrame(cuts_rows).to_csv(out/"wall_cutoffs.csv", index=False)
+    split_combined = {k: pd.concat(v, ignore_index=True) if v else pd.DataFrame() for k,v in events_by_split.items()}
+    surface = grid_surface(split_combined)
+    surface.to_csv(out/"parameter_surface.csv", index=False)
+    selected = select_rule(surface)
+    (out/"selected_rule.json").write_text(json.dumps(selected, indent=2, default=str)+"\n")
+    money = money_table(selected, surface)
+    money.to_csv(out/"monthly_dollars.csv", index=False)
+
+    summary = {
+        "dataset": DATASET_ID,
+        "assets": args.assets,
+        "development_day": args.development_day,
+        "holdout_day": args.holdout_day,
+        "events": int(len(event_df)),
+        "development_events": int((event_df["split"]=="development").sum()) if len(event_df) else 0,
+        "holdout_events": int((event_df["split"]=="holdout").sum()) if len(event_df) else 0,
+        "flow_confirmed_events": int((event_df["gamma_net"]>=.10).sum()) if len(event_df) else 0,
+        "selected_rule": selected,
+        "status": "REAL_PUBLIC_DATA_SCAN_COMPLETE",
+        "live_capital": "NO_GO",
+    }
+    (out/"summary.json").write_text(json.dumps(summary, indent=2, default=str)+"\n")
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
